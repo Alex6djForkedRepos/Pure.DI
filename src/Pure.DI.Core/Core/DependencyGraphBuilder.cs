@@ -6,6 +6,8 @@
 
 namespace Pure.DI.Core;
 
+using Injection = Models.Injection;
+
 internal sealed class DependencyGraphBuilder(
     IEnumerable<IBuilder<MdSetup, IEnumerable<DependencyNode>>> dependencyNodeBuilders,
     IBuilder<ContractsBuildContext, ISet<Injection>> contractsBuilder,
@@ -26,6 +28,7 @@ internal sealed class DependencyGraphBuilder(
         dependencyGraph = default;
         var maxId = 0;
         var map = new Dictionary<Injection, DependencyNode>(nodes.Count);
+        var contextMap = new Dictionary<Injection, DependencyNode>(nodes.Count);
         var queue = new Queue<ProcessingNode>();
         var roots = new List<DependencyNode>();
         foreach (var processingNode in nodes)
@@ -42,11 +45,6 @@ internal sealed class DependencyGraphBuilder(
                 foreach (var contract in processingNode.Contracts)
                 {
                     map[contract] = node;
-                }
-
-                if (!processingNode.IsMarkerBased)
-                {
-                    queue.Enqueue(processingNode);
                 }
             }
             else
@@ -68,6 +66,7 @@ internal sealed class DependencyGraphBuilder(
             accs.Add(accumulator);
         }
 
+        var processedInjection = new HashSet<Injection>();
         var processed = new HashSet<ProcessingNode>();
         var notProcessed = new HashSet<ProcessingNode>();
         var edgesMap = new Dictionary<ProcessingNode, List<Dependency>>();
@@ -84,11 +83,17 @@ internal sealed class DependencyGraphBuilder(
             var isProcessed = true;
             foreach (var (injection, hasExplicitDefaultValue, explicitDefaultValue) in node.Injections)
             {
+                if (!processedInjection.Add(injection))
+                {
+                    continue;
+                }
+
                 if (map.TryGetValue(injection, out var sourceNode))
                 {
                     if (!marker.IsMarkerBased(setup, sourceNode.Type))
                     {
                         registryManager.Register(setup, sourceNode.Binding);
+                        queue.Enqueue(CreateNewProcessingNode(setup, injection, sourceNode));
                         continue;
                     }
                 }
@@ -141,16 +146,13 @@ internal sealed class DependencyGraphBuilder(
                                 ++maxId);
 
                             var genericNode = CreateNodes(setup, genericBinding).Single(i => i.Variation == sourceNode.Variation);
-                            map[injection] = genericNode;
+                            UpdateMap(injection, genericNode);
                             foreach (var contract in genericBinding.Contracts.Where(i => i.ContractType is not null))
                             {
                                 foreach (var tag in contract.Tags.Select(i => i.Value).DefaultIfEmpty(default))
                                 {
                                     var newInjection = new Injection(InjectionKind.Contract, contract.ContractType!, tag);
-                                    if (!map.ContainsKey(newInjection))
-                                    {
-                                        map[newInjection] = genericNode;
-                                    }
+                                    UpdateMap(newInjection, genericNode);
                                 }
                             }
 
@@ -187,7 +189,7 @@ internal sealed class DependencyGraphBuilder(
 
                                     foreach (var newNode in CreateNodes(setup, constructBinding))
                                     {
-                                        map[injection] = newNode;
+                                        UpdateMap(injection, newNode);
                                         var processingNode = CreateNewProcessingNode(setup, injection, newNode);
                                         queue.Enqueue(processingNode);
                                     }
@@ -219,7 +221,7 @@ internal sealed class DependencyGraphBuilder(
 
                         foreach (var newNode in CreateNodes(setup, arrayBinding))
                         {
-                            map[injection] = newNode;
+                            UpdateMap(injection, newNode);
                             queue.Enqueue(CreateNewProcessingNode(setup, injection, newNode));
                         }
 
@@ -270,7 +272,7 @@ internal sealed class DependencyGraphBuilder(
 
                     foreach (var newNode in CreateNodes(setup, compositionBinding))
                     {
-                        map[injection] = newNode;
+                        UpdateMap(injection, newNode);
                         queue.Enqueue(CreateNewProcessingNode(setup, injection, newNode));
                     }
 
@@ -319,7 +321,7 @@ internal sealed class DependencyGraphBuilder(
             foreach (var injectionInfo in node.Injections)
             {
                 var injection = injectionInfo.Injection;
-                var dependency = map.TryGetValue(injection, out var sourceNode)
+                var dependency = map.TryGetValue(injection, out var sourceNode) || contextMap.TryGetValue(injection, out sourceNode)
                     ? new Dependency(true, sourceNode, injection, node.Node)
                     : new Dependency(false, new DependencyNode(0, node.Node.Binding), injection, node.Node);
 
@@ -331,6 +333,18 @@ internal sealed class DependencyGraphBuilder(
 
         dependencyGraph = CreateGraph(setup, roots, entries, map);
         return ImmutableArray<DependencyNode>.Empty;
+
+        void UpdateMap(Injection injection, DependencyNode node)
+        {
+            if (node.Factory is { Source.HasContextTag: true })
+            {
+                contextMap[injection] = node;
+            }
+            else
+            {
+                map[injection] = node;
+            }
+        }
     }
 
     private MdConstructKind GetConstructKind(INamedTypeSymbol geneticType)
